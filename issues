@@ -37,3 +37,42 @@ Reproduced on kind (KubeElasti v0.1.25 official image) then built and deployed a
 
 - Delete the resolver Deployment
 - Operator log (excerpt):
+WARN  Resolver deployment deleted, switching proxy-mode services to serve mode  {"deployment_name": "elasti-resolver", "proxy_mode_services": 1}
+DEBUG [Switching to SERVE Mode]  {"es": "demo/whoami"}
+INFO  1. Deleted endpointslice to resolver  {"service": "demo/whoami"}
+INFO  [SERVE mode enabled]  {"es": "demo/whoami"}
+INFO  CRD Status updated successfully
+INFO  Switched service to serve mode after resolver deletion  {"es": "demo/whoami"}
+
+- ElastiService `.status.mode` transitions to `serve`
+- Hijacked EndpointSlice is deleted
+- 10 requests through curlbox: `HTTP 000 in ~5ms each` (10/10) — instant connection-refused at kube-proxy because the workload has zero pods and no endpoints. Fast, loud failure instead of a silent 5-second timeout.
+
+**Regression check — the happy path still works:**
+
+- Restored the resolver (`helm upgrade`), re-applied the fix image on the operator
+- Waited for the service to return to proxy mode
+- Cold-start request through curlbox: `HTTP 200 in 4.35s` (scale-up latency)
+- Workload pod comes up as expected
+- Warm-path request: `HTTP 200 in 90ms`
+
+## Observed behavior after fix
+
+While the resolver Deployment is absent, the operator will continue to attempt proxy-mode transitions for services whose scale-target reports zero replicas. These attempts fail with a clear error message (`Failed to get IPs for Resolver: no Resolver pod found`) and do not corrupt state — the service stays in serve mode functionally. Once the resolver is restored, the existing informer machinery re-engages on the next scale-target change.
+
+## Out of scope
+
+Two related concerns that are deliberately not addressed here:
+
+- **Resolver Deployment in an unhealthy/restarting state** (crash-loop, OOM, etc.) — mentioned in the original TODO. The design trade-offs are different enough that I didn't want to conflate them; happy to file a follow-up issue if there's interest.
+- **Auto-scaling workloads up in response to resolver loss** — deliberately not done. Scale-from-zero requires the resolver by design; without it, the correct behavior is to route traffic directly to whatever replicas the workload currently has (which may be zero, producing loud connection-refused errors). Auto-scaling on infrastructure loss is a policy question separate from this fix.
+- **A finalizer preventing resolver Deployment deletion** — mentioned as option 2 in the original TODO. Rejected because it would block legitimate user operations like `helm uninstall`. The serve-mode fallback is friendlier to user intent.
+
+## Checklist
+
+- [x] I have performed a self-review of my own code
+- [ ] I have made corresponding changes to the documentation
+- [x] I have added tests that prove my fix is effective — real-cluster reproduction and regression run documented above; no unit test added because the change is triggered by an informer event that's difficult to exercise deterministically in unit tests (following the pattern of #293)
+- [x] New and existing unit tests pass locally
+- [ ] A PR is open to update the helm chart if applicable — not applicable
+- [x] I have updated the [CHANGELOG.md](./CHANGELOG.md) file with the changes I made
