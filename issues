@@ -1,0 +1,214 @@
+Title
+Silent traffic loss when resolver Deployment is deleted while services are in proxy mode
+Bug description
+(What went wrong? Summarize the issue in a few sentences.)
+markdownWhen the resolver Deployment is deleted (via `helm uninstall`, `kubectl delete deployment`, namespace deletion, etc.) while one or more `ElastiService`s are in proxy mode, the hijacked EndpointSlices continue pointing at now-dead resolver pod IPs. kube-proxy keeps routing traffic to those IPs, and clients experience silent 5-second timeouts with `HTTP 000` (no HTTP response ever received). The `DeleteFunc` handler on the resolver Deployment informer is a TODO — it logs a warning but takes no reconciliation action, so there is no recovery.
+
+Severity is high because the failure is silent: dashboards show the Service is up, the EndpointSlice has endpoints, workload Deployments look correct. Only the client-side timeouts reveal the problem.
+Steps to reproduce
+(How can we see the same behavior? Include commands, manifests and settings where possible.)
+markdownReproduced on a fresh kind cluster running KubeElasti v0.1.25.
+
+**1. Cluster and dependencies:**
+
+```bash
+kind create cluster --name elasti-test
+
+helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace \
+  --set alertmanager.enabled=false --set grafana.enabled=false \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+
+helm install elasti oci://tfy.jfrog.io/tfy-helm/elasti -n elasti --create-namespace
+```
+
+**2. Test workload:**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: whoami }
+  template:
+    metadata:
+      labels: { app: whoami }
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10
+          ports: [{ containerPort: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: demo
+spec:
+  selector: { app: whoami }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: elasti.truefoundry.com/v1alpha1
+kind: ElastiService
+metadata:
+  name: whoami
+  namespace: demo
+spec:
+  minTargetReplicas: 1
+  service: whoami
+  cooldownPeriod: 30
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: whoami
+  triggers:
+    - type: prometheus
+      metadata:
+        query: vector(0)
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        threshold: "0.5"
+```
+
+The `vector(0)` trigger always evaluates below threshold, so the service transitions to proxy mode within ~30 seconds and stays there.
+
+**3. In-cluster curl pod (for testing traffic without a mesh/ingress):**
+
+```bash
+kubectl run curlbox --image=curlimages/curl:8.10.1 -n demo --restart=Never -- sleep infinity
+```
+
+**4. Wait for proxy mode and verify hijack:**
+
+```bash
+# Confirm mode
+kubectl get elastiservice whoami -n demo -o jsonpath='{.status.mode}'
+# → "proxy"
+
+# Confirm EndpointSlice points at resolver pods
+kubectl get endpointslice -n demo -l kubernetes.io/service-name=whoami \
+  -o jsonpath='{.items[0].endpoints[*].addresses}'
+# → e.g. ["10.244.0.12"] (resolver pod IP)
+```
+
+**5. Trigger the bug — delete the resolver Deployment:**
+
+```bash
+kubectl delete deployment elasti-resolver -n elasti
+```
+
+**6. Send traffic:**
+
+```bash
+1..10 | ForEach-Object {
+  kubectl exec -n demo curlbox -- curl -s -o /dev/null \
+    -w "HTTP %{http_code} in %{time_total}s\n" \
+    --max-time 5 http://whoami.demo.svc.cluster.local/
+}
+```
+Expected behavior
+(What did you expect to happen?)
+markdownOn resolver Deployment deletion, the operator should switch all proxy-mode `ElastiService`s back to serve mode. This deletes the hijacked EndpointSlice and lets Kubernetes' built-in EndpointSlice controller take over, restoring direct routing to the target workload.
+
+Requests to a workload with zero replicas will then fail *immediately* at the transport layer (connection refused / `HTTP 000` in a few milliseconds) — a visible, diagnosable failure — rather than the current silent 5-second timeout.
+
+When the resolver is later recreated (e.g. via `helm upgrade`), the existing informer machinery re-engages and re-establishes the hijack on the next scale-down.
+Actual behavior
+(What happened instead? Include error messages if any.)
+markdownThe `DeleteFunc` handler at `operator/internal/controller/opsInformer.go` (around line 62) is currently a TODO and only logs a warning:
+
+```go
+DeleteFunc: func(_ interface{}) {
+    // TODO: Handle deletion of resolver deployment
+    // ...
+    r.Logger.Warn("Resolver deployment deleted", ...)
+},
+```
+
+No reconciliation happens. The hijacked EndpointSlice retains its stale IPs indefinitely:
+$ kubectl get endpointslice -n demo -l kubernetes.io/service-name=whoami 
+-o jsonpath='{.items[0].endpoints[*].addresses}'
+["10.244.0.12"]
+
+kube-proxy keeps routing to that dead IP. Client observation from the reproduction steps:
+Request 1 : HTTP 000 in 5.001751s
+Request 2 : HTTP 000 in 5.001423s
+Request 3 : HTTP 000 in 5.000486s
+Request 4 : HTTP 000 in 5.000471s
+Request 5 : HTTP 000 in 5.000947s
+Request 6 : HTTP 000 in 5.001291s
+Request 7 : HTTP 000 in 5.001920s
+Request 8 : HTTP 000 in 5.001484s
+Request 9 : HTTP 000 in 5.001816s
+Request 10 : HTTP 000 in 5.000850s
+
+`HTTP 000` combined with `exit code 28` (curl's timeout code) confirms curl never received *any* HTTP response — the TCP SYN went to a non-existent IP and hit `--max-time 5`. Silent traffic loss.
+
+Additionally, if the `ElastiService`'s scale target subsequently changes, the operator repeatedly tries to re-enter proxy mode and fails loudly (which is fine — loud is preferable to silent — but it shows the mode transition machinery keeps thrashing until a resolver comes back):
+ERROR  opsEndpointslices.go:58  Failed to get IPs for Resolver
+{"service": "whoami", "error": "no Resolver pod found"}
+ERROR  opsModes.go:48  Failed to enable PROXY mode
+{"error": "failed to create or update endpointslice to resolver: no Resolver pod found"}
+
+Environment
+Each of these gets pasted into the corresponding sub-field:
+Kubernetes version:
+Client Version: v1.31.x (kind default)
+Server Version: v1.36.1 (kind node)
+Note: yours showed v1.36.1 in your earlier output — if the client version box wants the exact kubectl version client string, run kubectl version and paste the actual line. If not asked, Server Version: v1.36.1 (kind) is enough.
+Elasti version:
+Helm chart: elasti 0.1.25 (oci://tfy.jfrog.io/tfy-helm/elasti)
+Operator image: tfy.jfrog.io/tfy-images/elasti-operator:0.1.25
+Helm values or install overrides (optional):
+Default chart values — no overrides. Installed via:
+helm install elasti oci://tfy.jfrog.io/tfy-helm/elasti -n elasti --create-namespace
+External Components in the request path:
+None — reproduction uses an in-cluster curl pod hitting the target Service by ClusterIP DNS. No ingress controller, no service mesh, no gateway.
+Autoscaler in use:
+None (KubeElasti's own Prometheus trigger only; no HPA or KEDA in front of the target workload).
+Cloud Provider (if applicable):
+N/A — kind cluster on a local Windows workstation.
+Logs and additional context:
+markdown**Operator log immediately after `kubectl delete deployment elasti-resolver`:**
+2026-07-02T21:53:15.512Z  INFO  controller/opsInformer.go:102  Public service updated
+{"service": "whoami", "es": "demo/whoami"}
+2026-07-02T22:34:08.970Z  WARN  controller/opsInformer.go:70   Resolver deployment deleted
+{"deployment_name": "elasti-resolver"}
+2026-07-02T22:34:11.373Z  DEBUG ScaleHandler  scaling/scale_handler.go:344  Scaling
+{"kind": "Deployment", "namespace": "demo", "name": "whoami",
+"desired replicas": 0}
+
+Only that single WARN is emitted for the deletion. No `SERVE mode` transition, no EndpointSlice cleanup, nothing.
+
+**Proposed fix**
+
+I have a working fix ready and validated on the same kind cluster. Design summary:
+
+- Fill in the `DeleteFunc` handler to iterate every `ElastiService` in proxy mode via `CRDDirectory.Services` and call the existing `switchMode(ctx, req, values.ServeMode)` code path (the same one used for normal proxy → serve transitions).
+- Best-effort iteration: per-service errors are logged with the service identifier and the loop continues.
+- Defensive assertions (`, ok :=` on type assertions, nil checks, split-length check) so unexpected values in `CRDDirectory` result in logged errors rather than panics.
+
+Post-fix behavior on the same reproduction: `WARN` log with the count of affected services, `[SERVE mode enabled]` per service, hijacked EndpointSlice deleted, ElastiService `.status.mode` transitions to `serve`, requests now fail in ~5ms with `HTTP 000` instead of 5s — a visible, diagnosable failure surface.
+
+Rejected the alternative of adding a finalizer to the resolver Deployment (mentioned as option 2 in the TODO comment) because it would block legitimate user operations like `helm uninstall`.
+
+Will open a PR shortly referencing this issue.
+
+**Out of scope**
+
+The related concern of resolver Deployment in an *unhealthy* or *restarting* state (also mentioned in the TODO comment) has different design trade-offs — happy to discuss in a follow-up issue if there's interest, but not addressing here.
+
+Before you submit
+Two quick things to double-check:
+1. Verify your Kubernetes version. Run this in PowerShell right now:
+powershellkubectl version
+Paste the "Server Version" line into the Kubernetes version field. If it's not exactly v1.36.1, use whatever it actually says — accuracy matters.
+2. Preview the issue before submitting. Most GitHub issue templates have a "Preview" tab next to "Write." Click it, scroll through, make sure code blocks render properly, no double-escaping happened, links work. Fix any weird rendering before you hit Submit.
